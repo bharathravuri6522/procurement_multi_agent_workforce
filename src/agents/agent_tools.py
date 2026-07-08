@@ -268,7 +268,8 @@ def get_supplier_options(item_id: str) -> List[Dict[str, Any]]:
                 contracted_price_usd as contracted_price,
                 spot_price_usd as spot_price,
                 moq,
-                volume_discount_pct
+                volume_discount_pct,
+                volume_threshold
             FROM supplier_item_pricing
             WHERE supplier_id = ? AND item_id = ? AND is_active = 1
             LIMIT 1
@@ -283,12 +284,14 @@ def get_supplier_options(item_id: str) -> List[Dict[str, Any]]:
             supplier['spot_price'] = "Not available"
             supplier['moq'] = 1
             supplier['volume_discount_pct'] = 0
+            supplier['volume_threshold'] = 0
         
         # Step 3: Get item-level pricing thresholds
         cursor.execute("""
             SELECT 
                 unit_cost_usd as item_unit_cost,
-                spot_price_usd as item_spot_price_threshold
+                spot_price_usd as item_spot_price_threshold,
+                lead_time_days as item_standard_lead_time_days
             FROM items
             WHERE item_id = ?
             LIMIT 1
@@ -300,6 +303,7 @@ def get_supplier_options(item_id: str) -> List[Dict[str, Any]]:
         else:
             supplier['item_unit_cost'] = "Not available"
             supplier['item_spot_price_threshold'] = "Not available"
+            supplier['item_standard_lead_time_days'] = "Not available"
         
         # Normalize field name for consistency downstream (use risk_level)
         supplier['risk_level'] = supplier.get('delay_risk_level')
