@@ -37,6 +37,7 @@ class AgentState(TypedDict):
     safety_stock: Optional[float]            # Minimum safety stock level
     net_requirement: Optional[float]         # Calculated: demand - stock + safety
     inventory_analysis: Optional[str]        # Natural language summary from analyst
+    demand_analysis: Optional[Dict[str, Any]]  # Full structured output from Demand & Inventory Analyst
 
     # ============================================================
     # SUPPLIER INTELLIGENCE (Agent 3)
@@ -45,6 +46,19 @@ class AgentState(TypedDict):
     recommended_supplier: Optional[Dict[str, Any]]     # Best supplier chosen
     supplier_reasoning: Optional[str]                  # Why this supplier was chosen
     alternative_suppliers: Optional[List[Dict[str, Any]]]  # Other options (for "why not X?")
+    supplier_intelligence_output: Optional[Dict[str, Any]]  # Full output from Supplier Intelligence (including cost calculations)
+
+    # ============================================================
+    # REASONING NODES (Contracted + Spot)
+    # ============================================================
+    contracted_reasoning: Optional[Dict[str, Any]]  # Output from Contracted Price Reasoning Node
+    spot_reasoning: Optional[Dict[str, Any]]        # Output from Spot Price Reasoning Node (fallback)
+    
+    # ============================================================
+    # Decision Aggregator
+    # ============================================================
+    risk_complexity_plan: Optional[Dict[str, Any]]
+    decision_aggregation: Optional[Dict[str, Any]]
 
     # ============================================================
     # HUMAN-IN-THE-LOOP
@@ -117,6 +131,13 @@ def create_initial_state(
         recommended_supplier=None,
         supplier_reasoning=None,
         alternative_suppliers=None,
+        supplier_intelligence_output=None,
+        demand_analysis=None,
+        contracted_reasoning=None,
+        spot_reasoning=None,
+        
+        decision_aggregation= None,
+        risk_complexity_plan= None,
 
         human_approved=None,
         human_feedback=None,
