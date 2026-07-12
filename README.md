@@ -54,6 +54,23 @@ The result is an end-to-end procurement platform that combines:
 
 ---
 
+# Platform Highlights
+
+| Capability                          | Description                                                                                                                     | Status |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | :----: |
+| 🤖 Multi-Agent Procurement Workflow | End-to-end AI workflow for demand planning, supplier intelligence, reasoning, review, PR creation, approval, and PO generation. |   ✅   |
+| 🧠 Deterministic + AI Architecture  | Business calculations remain deterministic while LLMs perform explainable reasoning and decision support.                       |   ✅   |
+| ⚡ Parallel Supplier Reasoning      | Contracted and Spot procurement strategies execute concurrently for every required item.                                        |   ✅   |
+| 🎯 Critical Path Optimization       | Hybrid procurement minimizes production delays while balancing procurement cost.                                                |   ✅   |
+| 👨‍💼 Human-in-the-Loop Review         | Reviewers can approve AI recommendations or override strategy and suppliers with complete audit history.                        |   ✅   |
+| 💾 Persistent Procurement Sessions  | Procurement analyses, conversations, and review decisions survive refreshes and application restarts.                           |   ✅   |
+| 💬 Stateful Procurement Assistant   | LangGraph-powered conversational assistant with contextual retrieval, memory, and procurement-specific Q&A.                     |   ✅   |
+| 📋 Purchase Requisition Workflow    | Converts reviewed procurement recommendations into enterprise Purchase Requisitions.                                            |   ✅   |
+| 📦 Purchase Order Generation        | Approved Purchase Requisitions automatically generate supplier-specific Purchase Orders.                                        |   ✅   |
+| 📈 LangSmith Observability          | End-to-end workflow tracing with nested execution visibility and performance insights.                                          |   ✅   |
+| 📝 Structured JSON Logging          | Production-grade centralized logging with audit-friendly event tracking.                                                        |   ✅   |
+| 🔍 Enterprise Audit Trail           | Preserves immutable AI recommendations alongside all human decisions and overrides.                                             |   ✅   |
+
 # Why ForgeForce?
 
 Traditional AI procurement demonstrations typically generate supplier recommendations directly from an LLM. While impressive, those approaches often lack determinism, traceability, and governance—qualities that are essential in enterprise procurement.
