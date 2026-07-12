@@ -196,3 +196,176 @@ flowchart TD
     PR -.-> LOGGING["Structured JSON Logging"]
     PO -.-> LOGGING
 ```
+
+---
+
+# Procurement Workflow
+
+The procurement workflow combines deterministic planning with AI-assisted reasoning. Business calculations are performed through rule-based logic, while LLMs evaluate supplier trade-offs and produce explainable recommendations.
+
+```mermaid
+flowchart LR
+A[Demand & Inventory Analysis] --> B[Supplier Intelligence]
+B --> C[Risk & Complexity Planner]
+C --> D[Parallel Strategy Executor]
+D --> E[Contracted Reasoning]
+D --> F[Spot Reasoning]
+E --> G[Decision Aggregator]
+F --> G
+G --> H[Human Review]
+H --> I[Purchase Requisition]
+I --> J[Manager Approval]
+J --> K[Purchase Orders]
+```
+
+The workflow begins by calculating net procurement requirements from demand forecasts, inventory, safety stock and open purchase orders. Supplier intelligence enriches each required item with pricing, lead times, capacity and risk. Contracted and spot procurement strategies are evaluated in parallel before a deterministic decision aggregator builds the recommended procurement plan. Human reviewers can approve or override recommendations before downstream execution.
+
+---
+
+# Conversation Workflow
+
+```mermaid
+flowchart LR
+A[User Question] --> B[Query Analyzer]
+B --> C[Context Builder]
+C --> D[Answer Generator]
+D --> E[Conversation Memory]
+E --> F[Response]
+```
+
+The conversation engine analyzes user intent, retrieves only the most relevant procurement context, generates grounded responses, and continuously summarizes conversation history.
+
+---
+
+# Human Review Workflow
+
+```mermaid
+flowchart LR
+A[AI Recommendation] --> B[Human Review]
+B --> C{Override?}
+C -->|No| D[Approve]
+C -->|Yes| E[Strategy / Supplier Override]
+D --> F[Effective Plan]
+E --> F
+F --> G[Persist Decision]
+G --> H[Create Purchase Requisition]
+```
+
+AI recommendations remain immutable. Human decisions are stored separately and combined into an effective procurement plan used for execution.
+
+---
+
+# Purchase Requisition to Purchase Order Lifecycle
+
+```mermaid
+flowchart LR
+A[Reviewed Plan] --> B[Purchase Requisition]
+B --> C[Manager Approval]
+C -->|Approved| D[Generate Purchase Orders]
+C -->|Rejected| E[Return for Review]
+D --> F[Supplier-specific Purchase Orders]
+```
+
+---
+
+# Repository Structure
+
+```text
+src/
+├── agents/
+├── conversation/
+├── core/
+├── pr_po/
+├── ui/
+├── scripts/
+├── persistence.py
+└── streamlit_app.py
+```
+
+---
+
+# Technology Stack
+
+| Layer         | Technology                  |
+| ------------- | --------------------------- |
+| UI            | Streamlit                   |
+| Workflow      | LangGraph                   |
+| LLM           | OpenAI GPT-4o / GPT-4o-mini |
+| AI Framework  | LangChain                   |
+| Database      | SQLite                      |
+| Observability | LangSmith                   |
+| Logging       | Structured JSON             |
+| Language      | Python 3.11                 |
+
+---
+
+# Installation
+
+```bash
+git clone <repository-url>
+cd procurement_multi_agent_workforce
+
+python -m venv venv
+```
+
+Windows
+
+```bash
+venv\Scripts\activate
+```
+
+Linux / macOS
+
+```bash
+source venv/bin/activate
+```
+
+Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+# Configuration
+
+```env
+OPENAI_API_KEY=
+LANGCHAIN_API_KEY=
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_PROJECT=ForgeForce Procurement AI
+DATABASE_PATH=data/forgeforce.db
+LOG_LEVEL=INFO
+```
+
+---
+
+# Database Initialization
+
+```bash
+python -m scripts.database_setup
+python -m pr_po.schema_migration
+```
+
+Run once for a new database.
+
+---
+
+# Running the Application
+
+```bash
+streamlit run src/streamlit_app.py
+```
+
+---
+
+# Screenshots
+
+Include screenshots of the Dashboard, Procurement Analysis, Human Review, Conversation Assistant, Purchase Requisition, Purchase Orders and LangSmith traces.
+
+---
+
+# License
+
+This project is intended for educational, research and portfolio purposes unless otherwise specified by the repository license.
