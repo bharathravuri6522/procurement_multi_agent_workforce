@@ -154,42 +154,45 @@ The platform demonstrates how AI can augment procurement professionals instead o
 
 ## Platform at a Glance
 
+ForgeForce uses a LangGraph-based Supervisor Agent to orchestrate the procurement workflow. Deterministic agents prepare and enrich procurement data, LLM-powered reasoning evaluates supplier trade-offs, and human reviewers retain final decision authority before PR and PO execution.
+
 ```mermaid
-flowchart LR
+flowchart TD
+    USER["Procurement User"] --> UI["Streamlit Application"]
 
-A[Demand Analysis]
---> B[Supplier Intelligence]
+    UI --> SUP["Supervisor Agent<br/>LangGraph Orchestrator"]
 
-B
---> C[Risk & Complexity Planner]
+    subgraph PROCUREMENT["Procurement Intelligence Workflow"]
+        SUP --> DEMAND["Demand & Inventory Analyst"]
+        DEMAND --> SUPPLIER["Supplier Intelligence Agent"]
+        SUPPLIER --> PLANNER["Risk & Complexity Planner"]
 
-C
---> D[Parallel Contracted Reasoning]
+        PLANNER --> EXECUTOR["Parallel Strategy Executor"]
+        EXECUTOR --> CONTRACTED["Contracted Supplier Reasoning"]
+        EXECUTOR --> SPOT["Spot Supplier Reasoning"]
 
-C
---> E[Parallel Spot Reasoning]
+        CONTRACTED --> AGGREGATOR["Decision Aggregator"]
+        SPOT --> AGGREGATOR
+    end
 
-D
---> F[Decision Aggregator]
+    AGGREGATOR --> REVIEW["Human Decision Review"]
+    REVIEW --> PR["Purchase Requisition"]
 
-E
---> F
+    PR --> APPROVAL["Approval Workflow"]
+    APPROVAL --> PO["Supplier-Specific Purchase Orders"]
 
-F
---> G[Human Review]
+    UI --> CONVERSATION["Conversation Workflow"]
+    CONVERSATION --> QUERY["Query Analyzer"]
+    QUERY --> CONTEXT["Selective Context Builder"]
+    CONTEXT --> ANSWER["Answer Generator"]
+    ANSWER --> MEMORY["Conversation Memory & Summarization"]
 
-G
---> H[Purchase Requisition]
+    REVIEW -.-> DATABASE[("SQLite Persistence")]
+    PR -.-> DATABASE
+    PO -.-> DATABASE
+    MEMORY -.-> DATABASE
 
-H
---> I[Approval Workflow]
-
-I
---> J[Purchase Orders]
-
-F
---> K[Conversation Assistant]
-
-K
---> L[Persistent Memory]
+    SUP -.-> OBSERVABILITY["LangSmith Tracing"]
+    PR -.-> LOGGING["Structured JSON Logging"]
+    PO -.-> LOGGING
 ```
