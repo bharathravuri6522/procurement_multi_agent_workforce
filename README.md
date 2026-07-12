@@ -151,3 +151,45 @@ The platform demonstrates how AI can augment procurement professionals instead o
 - Fully deterministic execution
 
 ---
+
+## Platform at a Glance
+
+```mermaid
+flowchart LR
+
+A[Demand Analysis]
+--> B[Supplier Intelligence]
+
+B
+--> C[Risk & Complexity Planner]
+
+C
+--> D[Parallel Contracted Reasoning]
+
+C
+--> E[Parallel Spot Reasoning]
+
+D
+--> F[Decision Aggregator]
+
+E
+--> F
+
+F
+--> G[Human Review]
+
+G
+--> H[Purchase Requisition]
+
+H
+--> I[Approval Workflow]
+
+I
+--> J[Purchase Orders]
+
+F
+--> K[Conversation Assistant]
+
+K
+--> L[Persistent Memory]
+```
