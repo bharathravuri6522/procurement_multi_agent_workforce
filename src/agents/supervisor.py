@@ -1,99 +1,84 @@
 """
-supervisor_with_decision_aggregator_v1.py
-Version: 1.0-decision-aggregator
+Supervisor and orchestration graph for ForgeForce Procurement AI.
 
-Supervisor / Orchestrator for the Multi-Agent Procurement System.
-
-This version keeps the planner-driven routing foundation and adds a deterministic
-Decision Aggregator after the strategy reasoning step.
-
-Important design decision:
-- The decision aggregator does NOT call an LLM.
-- It reads prior outputs from AgentState and combines them into a user-facing
-  procurement decision + detailed plan.
+The supervisor coordinates deterministic analysis and LLM reasoning nodes,
+then produces a single aggregated procurement recommendation.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from langgraph.graph import StateGraph, END
+from contextvars import copy_context
+from datetime import date
+import time
+from typing import Any, Dict, List, Optional
+
+from langgraph.graph import END, StateGraph
 
 from agent_state import AgentState
-from demand_inventory_analyst import analyze_demand_and_inventory
-from supplier_intelligence_agent import recommend_suppliers
-from reasoning_node import reason_and_recommend
-from spot_reasoning_node import reason_with_spot_strategy
-from risk_complexity_planner import calculate_procurement_complexity
 from decision_aggregator import aggregate_procurement_decision
+from demand_inventory_analyst import analyze_demand_and_inventory
+from reasoning_node import reason_and_recommend
+from risk_complexity_planner import calculate_procurement_complexity
+from spot_reasoning_node import reason_with_spot_strategy
+from supplier_intelligence_agent import recommend_suppliers
+
+from core.exceptions import (
+    DecisionAggregationError,
+    DemandAnalysisError,
+    PlannerError,
+    SupplierIntelligenceError,
+    SupplierReasoningError,
+    WorkflowExecutionError,
+)
+from core.config import settings
+from core.logging import bind_log_context, get_logger, reset_log_context
+from core.observability import (
+    build_trace_metadata,
+    langsmith_extra as build_langsmith_extra,
+    traceable_if_enabled,
+)
+from core.timing import timed
 
 from workflow_logger import (
-    log_header,
-    log_initial_request,
-    log_node_start,
-    log_node_success,
-    log_node_error,
+    log_decision_aggregation,
     log_demand_analysis,
-    log_supplier_intelligence,
-    log_risk_complexity_planning,
     log_execution_strategy,
     log_product_level_summary,
     log_reasoning_item_recommendations,
-    log_final_summary,
-    log_decision_aggregation,
+    log_risk_complexity_planning,
+    log_supplier_intelligence,
 )
 
 
-SUPERVISOR_VERSION = "supervisor_with_decision_aggregator_v2 | 1.1-buffer-aware-decision-aggregator"
+SUPERVISOR_VERSION = (
+    "supervisor_with_decision_aggregator_v6 "
+    "| parallel-context-propagation"
+)
+
+logger = get_logger("supervisor")
 
 
-# ============================================================
-# NODE FUNCTIONS
-# ============================================================
+def _run_verbose_log(log_function, *args: Any) -> None:
+    """Emit detailed legacy workflow reports only when explicitly enabled."""
+    if settings.verbose_workflow_logs:
+        log_function(*args)
 
-def demand_analyst_node(state: AgentState) -> Dict[str, Any]:
-    node = "demand_analyst"
-    log_node_start(node)
-    try:
-        result = analyze_demand_and_inventory(
-            product_id=state["product_id"],
-            demand_forecast=state.get("demand_forecast", 0),
-            required_date=state.get("current_date"),
+
+
+def _require_state_value(
+    state: AgentState,
+    key: str,
+    *,
+    component: str,
+) -> Any:
+    value = state.get(key)
+    if value is None:
+        raise WorkflowExecutionError(
+            f"Required workflow state is missing: {key}.",
+            component=component,
         )
-        print("  ✓ Demand and inventory analysis generated.")
-        log_demand_analysis(result)
-        log_node_success(node)
-        return {
-            "demand_analysis": result,
-            "current_agent": node,
-            "reasoning_trace": ["Demand & Inventory analysis completed."],
-        }
-    except Exception as e:
-        log_node_error(node, e)
-        return {"error_message": str(e)}
-
-
-def supplier_intelligence_node(state: AgentState) -> Dict[str, Any]:
-    node = "supplier_intelligence"
-    log_node_start(node)
-    if not state.get("demand_analysis"):
-        error = "Missing demand_analysis"
-        log_node_error(node, error)
-        return {"error_message": error}
-
-    try:
-        result = recommend_suppliers(state["demand_analysis"])
-        print("  ✓ Supplier intelligence context generated.")
-        log_supplier_intelligence(result)
-        log_node_success(node)
-        return {
-            "supplier_intelligence_output": result,
-            "current_agent": node,
-            "reasoning_trace": ["Supplier Intelligence + cost calculations completed."],
-        }
-    except Exception as e:
-        log_node_error(node, e)
-        return {"error_message": str(e)}
+    return value
 
 
 def _nodes_for_route(selected_route: str) -> List[str]:
@@ -104,165 +89,414 @@ def _nodes_for_route(selected_route: str) -> List[str]:
     }:
         return ["contracted_reasoning", "spot_reasoning"]
 
-    if selected_route in {"spot_only", "spot_only_with_risk_review"}:
+    if selected_route in {
+        "spot_only",
+        "spot_only_with_risk_review",
+    }:
         return ["spot_reasoning"]
 
     return ["contracted_reasoning"]
 
 
-def risk_complexity_planner_node(state: AgentState) -> Dict[str, Any]:
-    node = "risk_complexity_planner"
-    log_node_start(node)
-    if not state.get("supplier_intelligence_output"):
-        error = "Missing supplier_intelligence_output"
-        log_node_error(node, error)
-        return {"error_message": error}
+@timed(
+    component="demand_analyst",
+    event="demand_analysis_completed",
+)
+def demand_analyst_node(state: AgentState) -> Dict[str, Any]:
+    logger.info(
+        "demand_analysis_started",
+        component="demand_analyst",
+        status="running",
+        payload={
+            "product_id": state.get("product_id"),
+            "demand_forecast": state.get("demand_forecast"),
+            "required_date": state.get("current_date"),
+        },
+    )
 
     try:
-        plan = calculate_procurement_complexity(state["supplier_intelligence_output"])
-        selected_route = plan.get("selected_route", "contracted_only")
-        nodes_to_run = _nodes_for_route(selected_route)
-        plan["execution_nodes"] = nodes_to_run
+        result = analyze_demand_and_inventory(
+            product_id=state["product_id"],
+            demand_forecast=state.get("demand_forecast", 0),
+            required_date=state.get("current_date"),
+        )
+    except Exception as exc:
+        logger.exception(
+            "demand_analysis_failed",
+            error=exc,
+            component="demand_analyst",
+            status="failed",
+            payload={"product_id": state.get("product_id")},
+        )
+        raise DemandAnalysisError(
+            f"Demand analysis failed for product {state.get('product_id')}.",
+            component="demand_analyst",
+        ) from exc
 
-        print("  ✓ Risk / complexity plan generated.")
-        log_risk_complexity_planning(plan)
-        log_execution_strategy(plan, nodes_to_run)
-        log_node_success(node)
+    _run_verbose_log(log_demand_analysis, result)
 
-        return {
-            "risk_complexity_plan": plan,
-            "next_step": ",".join(nodes_to_run),
-            "current_agent": node,
-            "reasoning_trace": [
-                f"Risk/Complexity Planner selected route '{selected_route}' and execution nodes {nodes_to_run}."
-            ],
-        }
-    except Exception as e:
-        log_node_error(node, e)
-        return {"error_message": str(e)}
+    logger.info(
+        "demand_analysis_succeeded",
+        component="demand_analyst",
+        status="success",
+        payload={
+            "product_id": state.get("product_id"),
+            "items_requiring_procurement": len(
+                result.get("items_requiring_procurement", [])
+                if isinstance(result, dict)
+                else []
+            ),
+        },
+    )
 
-
-def _run_contracted_reasoning(state: AgentState) -> Dict[str, Any]:
-    result = reason_and_recommend(state["supplier_intelligence_output"])
-    result_dict = result.model_dump() if hasattr(result, "model_dump") else result
-    return result_dict
-
-
-def _run_spot_reasoning(state: AgentState) -> Dict[str, Any]:
-    result = reason_with_spot_strategy(state["supplier_intelligence_output"])
-    result_dict = result.model_dump() if hasattr(result, "model_dump") else result
-    return result_dict
+    return {
+        "demand_analysis": result,
+        "current_agent": "demand_analyst",
+        "reasoning_trace": ["Demand and inventory analysis completed."],
+    }
 
 
+@timed(
+    component="supplier_intelligence",
+    event="supplier_intelligence_completed",
+)
+def supplier_intelligence_node(state: AgentState) -> Dict[str, Any]:
+    demand_analysis = _require_state_value(
+        state,
+        "demand_analysis",
+        component="supplier_intelligence",
+    )
+
+    logger.info(
+        "supplier_intelligence_started",
+        component="supplier_intelligence",
+        status="running",
+    )
+
+    try:
+        result = recommend_suppliers(demand_analysis)
+    except Exception as exc:
+        logger.exception(
+            "supplier_intelligence_failed",
+            error=exc,
+            component="supplier_intelligence",
+            status="failed",
+        )
+        raise SupplierIntelligenceError(
+            "Supplier intelligence failed for the current procurement request.",
+            component="supplier_intelligence",
+        ) from exc
+
+    _run_verbose_log(log_supplier_intelligence, result)
+
+    analyzed_items = (
+        result.get("items_analyzed", [])
+        if isinstance(result, dict)
+        else []
+    )
+    supplier_count = sum(
+        len(item.get("suppliers", []) or [])
+        for item in analyzed_items
+        if isinstance(item, dict)
+    )
+
+    logger.info(
+        "supplier_intelligence_succeeded",
+        component="supplier_intelligence",
+        status="success",
+        payload={
+            "item_count": len(analyzed_items),
+            "supplier_option_count": supplier_count,
+        },
+    )
+
+    return {
+        "supplier_intelligence_output": result,
+        "current_agent": "supplier_intelligence",
+        "reasoning_trace": [
+            "Supplier intelligence and deterministic cost calculations completed."
+        ],
+    }
+
+
+@timed(
+    component="risk_complexity_planner",
+    event="risk_complexity_planning_completed",
+)
+def risk_complexity_planner_node(state: AgentState) -> Dict[str, Any]:
+    supplier_intelligence = _require_state_value(
+        state,
+        "supplier_intelligence_output",
+        component="risk_complexity_planner",
+    )
+
+    logger.info(
+        "risk_complexity_planning_started",
+        component="risk_complexity_planner",
+        status="running",
+    )
+
+    try:
+        plan = calculate_procurement_complexity(supplier_intelligence)
+    except Exception as exc:
+        logger.exception(
+            "risk_complexity_planning_failed",
+            error=exc,
+            component="risk_complexity_planner",
+            status="failed",
+        )
+        raise PlannerError(
+            "The procurement planner could not determine an execution route.",
+            component="risk_complexity_planner",
+        ) from exc
+
+    selected_route = plan.get("selected_route", "contracted_only")
+    nodes_to_run = _nodes_for_route(selected_route)
+    plan["execution_nodes"] = nodes_to_run
+
+    _run_verbose_log(log_risk_complexity_planning, plan)
+    _run_verbose_log(log_execution_strategy, plan, nodes_to_run)
+
+    logger.info(
+        "route_selected",
+        component="risk_complexity_planner",
+        status="success",
+        payload={
+            "selected_route": selected_route,
+            "complexity_score": plan.get("complexity_score"),
+            "complexity_level": plan.get("complexity_level"),
+            "execution_nodes": nodes_to_run,
+            "route_reason": plan.get("route_reason"),
+        },
+    )
+
+    return {
+        "risk_complexity_plan": plan,
+        "next_step": ",".join(nodes_to_run),
+        "current_agent": "risk_complexity_planner",
+        "reasoning_trace": [
+            (
+                "Risk and complexity planner selected route "
+                f"'{selected_route}' with execution nodes {nodes_to_run}."
+            )
+        ],
+    }
+
+
+def _run_contracted_reasoning(
+    supplier_intelligence: Dict[str, Any],
+) -> Dict[str, Any]:
+    result = reason_and_recommend(supplier_intelligence)
+    return result.model_dump() if hasattr(result, "model_dump") else result
+
+
+def _run_spot_reasoning(
+    supplier_intelligence: Dict[str, Any],
+) -> Dict[str, Any]:
+    result = reason_with_spot_strategy(supplier_intelligence)
+    return result.model_dump() if hasattr(result, "model_dump") else result
+
+
+def _log_reasoning_result(
+    strategy: str,
+    result: Dict[str, Any],
+) -> None:
+    title = (
+        "Contracted Product-Level Summary"
+        if strategy == "contracted_reasoning"
+        else "Spot Product-Level Summary"
+    )
+    label = "Contracted" if strategy == "contracted_reasoning" else "Spot"
+
+    _run_verbose_log(log_product_level_summary, result, title)
+    _run_verbose_log(log_reasoning_item_recommendations, result, label)
+
+
+@timed(
+    component="strategy_reasoning_executor",
+    event="strategy_reasoning_completed",
+)
 def strategy_reasoning_executor_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Execute selected reasoning strategies.
+    supplier_intelligence = _require_state_value(
+        state,
+        "supplier_intelligence_output",
+        component="strategy_reasoning_executor",
+    )
 
-    This node can execute contracted and spot reasoning concurrently using
-    ThreadPoolExecutor when the planner requests both. This keeps the graph easy
-    to join before Decision Aggregator while still preserving parallel strategy
-    evaluation behavior.
-    """
-    node = "strategy_reasoning_executor"
-    log_node_start(node)
-    if not state.get("supplier_intelligence_output"):
-        error = "Missing supplier_intelligence_output"
-        log_node_error(node, error)
-        return {"error_message": error}
+    requested_nodes = str(
+        state.get("next_step") or "contracted_reasoning"
+    ).split(",")
 
-    next_step = state.get("next_step") or "contracted_reasoning"
-    nodes_to_run = [n.strip() for n in str(next_step).split(",") if n.strip()]
-    nodes_to_run = [n for n in nodes_to_run if n in {"contracted_reasoning", "spot_reasoning"}]
+    nodes_to_run = [
+        node.strip()
+        for node in requested_nodes
+        if node.strip() in {"contracted_reasoning", "spot_reasoning"}
+    ]
+
     if not nodes_to_run:
         nodes_to_run = ["contracted_reasoning"]
 
+    logger.info(
+        "strategy_reasoning_started",
+        component="strategy_reasoning_executor",
+        status="running",
+        payload={
+            "execution_mode": "parallel" if len(nodes_to_run) > 1 else "single",
+            "strategies": nodes_to_run,
+        },
+    )
+
     updates: Dict[str, Any] = {
-        "current_agent": node,
+        "current_agent": "strategy_reasoning_executor",
         "reasoning_trace": [],
+    }
+
+    runners = {
+        "contracted_reasoning": _run_contracted_reasoning,
+        "spot_reasoning": _run_spot_reasoning,
     }
 
     try:
         if len(nodes_to_run) == 1:
-            selected = nodes_to_run[0]
-            log_node_start(selected)
-            if selected == "contracted_reasoning":
-                contracted = _run_contracted_reasoning(state)
-                print("  ✓ Contracted price reasoning completed.")
-                log_product_level_summary(contracted, "Contracted Product-Level Summary")
-                log_reasoning_item_recommendations(contracted, "Contracted")
-                updates["contracted_reasoning"] = contracted
-                updates["reasoning_trace"].append("Contracted Price reasoning completed.")
-                log_node_success(selected)
-            else:
-                spot = _run_spot_reasoning(state)
-                print("  ✓ Spot reasoning completed using item-level standard lead time.")
-                log_product_level_summary(spot, "Spot Product-Level Summary")
-                log_reasoning_item_recommendations(spot, "Spot")
-                updates["spot_reasoning"] = spot
-                updates["reasoning_trace"].append("Spot Price reasoning completed.")
-                log_node_success(selected)
+            strategy = nodes_to_run[0]
+            logger.info(
+                "reasoning_branch_started",
+                component=strategy,
+                status="running",
+            )
+            result = runners[strategy](supplier_intelligence)
+            _log_reasoning_result(strategy, result)
+            updates[strategy] = result
+            updates["reasoning_trace"].append(
+                f"{strategy.replace('_', ' ').title()} completed."
+            )
+            logger.info(
+                "reasoning_branch_completed",
+                component=strategy,
+                status="success",
+                payload={"item_count": len(result.get("items", []) or [])},
+            )
+            return updates
 
-        else:
-            # Execute selected strategies in parallel from the same supplier intelligence context.
-            futures = {}
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                for selected in nodes_to_run:
-                    log_node_start(selected)
-                    if selected == "contracted_reasoning":
-                        futures[executor.submit(_run_contracted_reasoning, state)] = selected
-                    elif selected == "spot_reasoning":
-                        futures[executor.submit(_run_spot_reasoning, state)] = selected
+        futures = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for strategy in nodes_to_run:
+                logger.info(
+                    "reasoning_branch_started",
+                    component=strategy,
+                    status="running",
+                    payload={"execution_mode": "parallel"},
+                )
+                worker_context = copy_context()
 
-                for future in as_completed(futures):
-                    selected = futures[future]
-                    result_dict = future.result()
-                    if selected == "contracted_reasoning":
-                        print("  ✓ Contracted price reasoning completed.")
-                        log_product_level_summary(result_dict, "Contracted Product-Level Summary")
-                        log_reasoning_item_recommendations(result_dict, "Contracted")
-                        updates["contracted_reasoning"] = result_dict
-                        updates["reasoning_trace"].append("Contracted Price reasoning completed.")
-                    elif selected == "spot_reasoning":
-                        print("  ✓ Spot reasoning completed using item-level standard lead time.")
-                        log_product_level_summary(result_dict, "Spot Product-Level Summary")
-                        log_reasoning_item_recommendations(result_dict, "Spot")
-                        updates["spot_reasoning"] = result_dict
-                        updates["reasoning_trace"].append("Spot Price reasoning completed.")
-                    log_node_success(selected)
+                futures[
+                    executor.submit(
+                        worker_context.run,
+                        runners[strategy],
+                        supplier_intelligence,
+                    )
+                ] = strategy
 
-        log_node_success(node)
-        return updates
+            for future in as_completed(futures):
+                strategy = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.exception(
+                        "reasoning_branch_failed",
+                        error=exc,
+                        component=strategy,
+                        status="failed",
+                    )
+                    raise
 
-    except Exception as e:
-        log_node_error(node, e)
-        return {"error_message": str(e)}
+                _log_reasoning_result(strategy, result)
+                updates[strategy] = result
+                updates["reasoning_trace"].append(
+                    f"{strategy.replace('_', ' ').title()} completed."
+                )
+                logger.info(
+                    "reasoning_branch_completed",
+                    component=strategy,
+                    status="success",
+                    payload={
+                        "execution_mode": "parallel",
+                        "item_count": len(result.get("items", []) or []),
+                    },
+                )
+
+    except Exception as exc:
+        logger.exception(
+            "strategy_reasoning_failed",
+            error=exc,
+            component="strategy_reasoning_executor",
+            status="failed",
+            payload={"strategies": nodes_to_run},
+        )
+        raise SupplierReasoningError(
+            "The selected procurement reasoning strategies could not be completed.",
+            component="strategy_reasoning_executor",
+        ) from exc
+
+    return updates
 
 
+@timed(
+    component="decision_aggregator",
+    event="decision_aggregation_completed",
+)
 def decision_aggregator_node(state: AgentState) -> Dict[str, Any]:
-    node = "decision_aggregator"
-    log_node_start(node)
+    logger.info(
+        "decision_aggregation_started",
+        component="decision_aggregator",
+        status="running",
+    )
+
     try:
         result = aggregate_procurement_decision(state)
-        print("  ✓ Decision aggregation completed.")
-        log_decision_aggregation(result)
-        log_node_success(node)
-        return {
-            "decision_aggregation": result,
-            "previous_recommendation": result,
-            "final_decision": "pending_human_review" if result.get("human_review_required") else "recommended",
-            "current_agent": node,
-            "reasoning_trace": [
-                f"Decision Aggregator recommended strategy '{result.get('recommended_strategy')}'."
-            ],
-        }
-    except Exception as e:
-        log_node_error(node, e)
-        return {"error_message": str(e)}
+    except Exception as exc:
+        logger.exception(
+            "decision_aggregation_failed",
+            error=exc,
+            component="decision_aggregator",
+            status="failed",
+        )
+        raise DecisionAggregationError(
+            "The final procurement recommendation could not be generated.",
+            component="decision_aggregator",
+        ) from exc
 
+    _run_verbose_log(log_decision_aggregation, result)
 
-# ============================================================
-# BUILD GRAPH
-# ============================================================
+    logger.info(
+        "decision_aggregation_succeeded",
+        component="decision_aggregator",
+        status="success",
+        payload={
+            "recommended_strategy": result.get("recommended_strategy"),
+            "decision_confidence": result.get("decision_confidence"),
+            "human_review_required": result.get("human_review_required"),
+            "plan_item_count": len(result.get("procurement_plan", []) or []),
+        },
+    )
+
+    return {
+        "decision_aggregation": result,
+        "previous_recommendation": result,
+        "final_decision": (
+            "pending_human_review"
+            if result.get("human_review_required")
+            else "recommended"
+        ),
+        "current_agent": "decision_aggregator",
+        "reasoning_trace": [
+            (
+                "Decision aggregator recommended strategy "
+                f"'{result.get('recommended_strategy')}'."
+            )
+        ],
+    }
+
 
 def build_supervisor_graph():
     workflow = StateGraph(AgentState)
@@ -270,25 +504,117 @@ def build_supervisor_graph():
     workflow.add_node("demand_analyst", demand_analyst_node)
     workflow.add_node("supplier_intelligence", supplier_intelligence_node)
     workflow.add_node("risk_complexity_planner", risk_complexity_planner_node)
-    workflow.add_node("strategy_reasoning_executor", strategy_reasoning_executor_node)
+    workflow.add_node(
+        "strategy_reasoning_executor",
+        strategy_reasoning_executor_node,
+    )
     workflow.add_node("decision_aggregator", decision_aggregator_node)
 
     workflow.set_entry_point("demand_analyst")
     workflow.add_edge("demand_analyst", "supplier_intelligence")
     workflow.add_edge("supplier_intelligence", "risk_complexity_planner")
-    workflow.add_edge("risk_complexity_planner", "strategy_reasoning_executor")
+    workflow.add_edge(
+        "risk_complexity_planner",
+        "strategy_reasoning_executor",
+    )
     workflow.add_edge("strategy_reasoning_executor", "decision_aggregator")
     workflow.add_edge("decision_aggregator", END)
 
     return workflow.compile()
 
 
-# ============================================================
-# PUBLIC ENTRY POINT
-# ============================================================
+def _validate_workflow_inputs(
+    product_id: str,
+    demand_forecast: float,
+    required_date: str,
+) -> None:
+    if not product_id or not product_id.strip():
+        raise WorkflowExecutionError(
+            "Product ID is required.",
+            component="supervisor",
+        )
 
-def run_procurement_workflow(product_id: str, demand_forecast: float, required_date: str) -> Dict[str, Any]:
-    app = build_supervisor_graph()
+    try:
+        quantity = float(demand_forecast)
+    except (TypeError, ValueError) as exc:
+        raise WorkflowExecutionError(
+            "Demand forecast must be a valid number.",
+            component="supervisor",
+        ) from exc
+
+    if quantity <= 0:
+        raise WorkflowExecutionError(
+            "Demand forecast must be greater than zero.",
+            component="supervisor",
+        )
+
+    if not required_date:
+        raise WorkflowExecutionError(
+            "Required date is required.",
+            component="supervisor",
+        )
+
+    try:
+        date.fromisoformat(str(required_date))
+    except ValueError as exc:
+        raise WorkflowExecutionError(
+            "Required date must use ISO format YYYY-MM-DD.",
+            component="supervisor",
+        ) from exc
+
+
+@traceable_if_enabled(
+    name="Procurement Workflow",
+    run_type="chain",
+    tags=["forgeforce", "procurement", "supervisor"],
+)
+def _run_procurement_workflow_traced(
+    product_id: str,
+    demand_forecast: float,
+    required_date: str,
+    *,
+    session_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    langsmith_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Run the complete procurement analysis workflow.
+
+    session_id and run_id are optional correlation fields. Existing callers that
+    provide only product_id, demand_forecast, and required_date remain valid.
+    """
+    _validate_workflow_inputs(
+        product_id=product_id,
+        demand_forecast=demand_forecast,
+        required_date=required_date,
+    )
+
+    context_token = bind_log_context(
+        session_id=session_id,
+        run_id=run_id,
+        product_id=product_id,
+        demand_forecast=demand_forecast,
+        required_date=required_date,
+        supervisor_version=SUPERVISOR_VERSION,
+    )
+    started_at = time.perf_counter()
+    completion_status = "failed"
+    completion_payload: Dict[str, Any] = {
+        "product_id": product_id,
+        "demand_forecast": demand_forecast,
+        "required_date": required_date,
+    }
+
+    logger.info(
+        "procurement_workflow_started",
+        component="supervisor",
+        status="running",
+        payload={
+            "product_id": product_id,
+            "demand_forecast": demand_forecast,
+            "required_date": required_date,
+        },
+    )
 
     initial_state: AgentState = {
         "product_id": product_id,
@@ -326,22 +652,90 @@ def run_procurement_workflow(product_id: str, demand_forecast: float, required_d
         "error_message": None,
     }
 
-    return app.invoke(initial_state)
+    try:
+        app = build_supervisor_graph()
+        result = app.invoke(initial_state)
+
+        recommended_strategy = (
+            result.get("decision_aggregation") or {}
+        ).get("recommended_strategy")
+        selected_route = (
+            result.get("risk_complexity_plan") or {}
+        ).get("selected_route")
+
+        completion_status = "success"
+        completion_payload.update({
+            "recommended_strategy": recommended_strategy,
+            "selected_route": selected_route,
+        })
+
+        logger.info(
+            "procurement_workflow_succeeded",
+            component="supervisor",
+            status="success",
+            payload={
+                "recommended_strategy": recommended_strategy,
+                "selected_route": selected_route,
+            },
+        )
+        return result
+
+    except WorkflowExecutionError:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "procurement_workflow_failed",
+            error=exc,
+            component="supervisor",
+            status="failed",
+            payload={"product_id": product_id},
+        )
+        raise WorkflowExecutionError(
+            f"Procurement workflow failed for product {product_id}.",
+            component="supervisor",
+            run_id=run_id,
+        ) from exc
+
+    finally:
+        logger.info(
+            "procurement_workflow_completed",
+            component="supervisor",
+            status=completion_status,
+            duration_ms=(time.perf_counter() - started_at) * 1000,
+            payload=completion_payload,
+        )
+        reset_log_context(context_token)
 
 
-if __name__ == "__main__":
-    product_id = "RS-240"
-    demand_forecast = 80
-    required_date = "2026-07-15"
-
-    log_header("ENTERPRISE PROCUREMENT WORKFLOW")
-    print(f"Supervisor Version: {SUPERVISOR_VERSION}")
-    log_initial_request(product_id, demand_forecast, required_date)
-
-    final_state = run_procurement_workflow(
+def run_procurement_workflow(
+    product_id: str,
+    demand_forecast: float,
+    required_date: str,
+    *,
+    session_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    langsmith_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run the procurement workflow under one searchable parent trace."""
+    trace_extra = langsmith_extra or build_langsmith_extra(
+        metadata=build_trace_metadata(
+            session_id=session_id,
+            run_id=run_id,
+            product_id=product_id,
+            demand_forecast=demand_forecast,
+            required_date=required_date,
+            component="supervisor",
+            supervisor_version=SUPERVISOR_VERSION,
+        ),
+        tags=["forgeforce", "procurement", "workflow"],
+        run_name="Procurement Workflow",
+    )
+    return _run_procurement_workflow_traced(
         product_id=product_id,
         demand_forecast=demand_forecast,
         required_date=required_date,
+        session_id=session_id,
+        run_id=run_id,
+        langsmith_extra=trace_extra,
     )
-
-    log_final_summary(final_state)
