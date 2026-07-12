@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 
 import streamlit as st
 
 from persistence import (
     load_latest_review_decision,
+    load_session_activity,
     save_decision_override,
     save_message,
     save_session_activity,
@@ -126,6 +128,150 @@ def _supplier_key(session_id: str, run_id: Optional[str], item_id: str) -> str:
     return f"supplier_override_{session_id}_{run_id}_{item_id}"
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+        return decoded if isinstance(decoded, dict) else {}
+
+    return {}
+
+
+def _normalize_saved_review(
+    saved_review: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Normalize review data loaded either from session state or persistence.
+
+    Older persistence records may store supplier overrides and the effective
+    decision inside metadata, while the current UI session stores them at the
+    top level.
+    """
+    if not saved_review:
+        return {}
+
+    metadata = _as_dict(saved_review.get("metadata"))
+    details = _as_dict(saved_review.get("details"))
+
+    effective_decision = _as_dict(
+        saved_review.get("effective_decision")
+        or metadata.get("effective_decision")
+        or metadata.get("effective_plan")
+        or details.get("effective_decision")
+    )
+
+    human_decision = _as_dict(
+        effective_decision.get("human_decision")
+    )
+
+    supplier_overrides = (
+        saved_review.get("supplier_overrides")
+        or metadata.get("supplier_overrides")
+        or details.get("supplier_overrides")
+        or human_decision.get("supplier_overrides")
+        or {}
+    )
+
+    override_strategy = (
+        saved_review.get("override_strategy")
+        or metadata.get("override_strategy")
+        or details.get("override_strategy")
+        or human_decision.get("override_strategy")
+        or "no_override"
+    )
+
+    override_reason = (
+        saved_review.get("override_reason")
+        or metadata.get("override_reason")
+        or details.get("override_reason")
+        or human_decision.get("override_reason")
+        or ""
+    )
+
+    return {
+        **saved_review,
+        "override_strategy": override_strategy,
+        "override_reason": override_reason,
+        "supplier_overrides": (
+            supplier_overrides
+            if isinstance(supplier_overrides, dict)
+            else {}
+        ),
+        "effective_decision": effective_decision,
+    }
+
+
+def _load_saved_review(
+    session_id: str,
+    run_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Load the complete saved review from the activity log first.
+
+    The recommendation activity contains the full effective decision,
+    supplier overrides, and requester reason. The decision-overrides table
+    remains a fallback for older records.
+    """
+    for activity in load_session_activity(
+        session_id,
+        limit=100,
+    ):
+        if (
+            run_id
+            and activity.get("run_id") != run_id
+        ):
+            continue
+
+        if activity.get("action") not in {
+            "recommendation_approved",
+            "recommendation_override_applied",
+        }:
+            continue
+
+        details = _as_dict(
+            activity.get("details") or {}
+        )
+        effective_decision = _as_dict(
+            details.get("effective_decision")
+            or {}
+        )
+
+        return _normalize_saved_review({
+            "session_id": session_id,
+            "run_id": activity.get("run_id"),
+            "created_at": activity.get("created_at"),
+            "action": activity.get("action"),
+            "override_strategy": details.get(
+                "override_strategy",
+                "no_override",
+            ),
+            "override_reason": details.get(
+                "override_reason",
+                "",
+            ),
+            "supplier_overrides": details.get(
+                "supplier_overrides",
+                {},
+            ),
+            "effective_decision": (
+                effective_decision
+            ),
+        })
+
+    return _normalize_saved_review(
+        load_latest_review_decision(
+            session_id=session_id,
+            run_id=run_id,
+        )
+    )
+
+
 def _initialize_review_widgets(
     session_id: str,
     run_id: Optional[str],
@@ -134,36 +280,128 @@ def _initialize_review_widgets(
     final_state: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     token = f"{session_id}:{run_id}"
-    if st.session_state.get("review_widgets_initialized_for_run") == token:
-        return st.session_state.get("saved_review_decision")
 
-    saved_review = st.session_state.get("saved_review_decision")
-    if not saved_review or saved_review.get("run_id") != run_id:
-        saved_review = load_latest_review_decision(session_id=session_id, run_id=run_id)
-        st.session_state.saved_review_decision = saved_review
-        st.session_state.review_state_run_id = run_id
+    expected_widget_keys = {
+        _strategy_key(session_id, run_id),
+        _reason_key(session_id, run_id),
+    }
 
-    strategy_key = _strategy_key(session_id, run_id)
-    reason_key = _reason_key(session_id, run_id)
+    for item in procurement_plan:
+        item_id = item.get("item_id")
+        if item_id:
+            expected_widget_keys.add(
+                _supplier_key(
+                    session_id,
+                    run_id,
+                    item_id,
+                )
+            )
 
-    saved_strategy = saved_review.get("override_strategy") if saved_review else "no_override"
+    widgets_still_present = all(
+        key in st.session_state
+        for key in expected_widget_keys
+    )
+
+    if (
+        st.session_state.get(
+            "review_widgets_initialized_for_run"
+        )
+        == token
+        and widgets_still_present
+    ):
+        return st.session_state.get(
+            "saved_review_decision"
+        )
+
+    saved_review = st.session_state.get(
+        "saved_review_decision"
+    )
+
+    if (
+        not saved_review
+        or saved_review.get("run_id") != run_id
+    ):
+        saved_review = _load_saved_review(
+            session_id=session_id,
+            run_id=run_id,
+        )
+    else:
+        saved_review = _normalize_saved_review(
+            saved_review
+        )
+
+    st.session_state.saved_review_decision = (
+        saved_review or None
+    )
+    st.session_state.review_state_run_id = (
+        run_id
+    )
+
+    strategy_key = _strategy_key(
+        session_id,
+        run_id,
+    )
+    reason_key = _reason_key(
+        session_id,
+        run_id,
+    )
+
+    saved_strategy = (
+        saved_review.get("override_strategy")
+        if saved_review
+        else "no_override"
+    )
+
     if saved_strategy not in strategy_options:
         saved_strategy = "no_override"
 
-    st.session_state[strategy_key] = saved_strategy
-    st.session_state[reason_key] = saved_review.get("override_reason", "") if saved_review else ""
+    st.session_state[strategy_key] = (
+        saved_strategy
+    )
+    st.session_state[reason_key] = (
+        saved_review.get("override_reason", "")
+        if saved_review
+        else ""
+    )
 
-    saved_supplier_overrides = saved_review.get("supplier_overrides", {}) if saved_review else {}
+    saved_supplier_overrides = (
+        saved_review.get(
+            "supplier_overrides",
+            {},
+        )
+        if saved_review
+        else {}
+    )
+
     for item in procurement_plan:
         item_id = item.get("item_id")
-        key = _supplier_key(session_id, run_id, item_id)
-        suppliers = get_available_suppliers_for_item(final_state, item_id)
-        saved_supplier = saved_supplier_overrides.get(item_id)
-        st.session_state[key] = (
-            saved_supplier if saved_supplier in suppliers else "No supplier override"
+        key = _supplier_key(
+            session_id,
+            run_id,
+            item_id,
+        )
+        suppliers = (
+            get_available_suppliers_for_item(
+                final_state,
+                item_id,
+            )
+        )
+        saved_supplier = (
+            saved_supplier_overrides.get(
+                item_id
+            )
         )
 
-    st.session_state.review_widgets_initialized_for_run = token
+        st.session_state[key] = (
+            saved_supplier
+            if saved_supplier in suppliers
+            else "No supplier override"
+        )
+
+    st.session_state[
+        "review_widgets_initialized_for_run"
+    ] = token
+
     return saved_review
 
 
@@ -192,6 +430,7 @@ def render_recommendation_review_controls(
         procurement_plan=procurement_plan,
         final_state=final_state,
     )
+
 
     strategy_key = _strategy_key(session_id, run_id)
     reason_key = _reason_key(session_id, run_id)
@@ -266,7 +505,7 @@ def render_recommendation_review_controls(
             session_id=session_id,
             run_id=run_id,
             original_strategy=original_strategy,
-            override_strategy=effective_preview["human_decision"]["final_strategy"],
+            override_strategy=override_strategy,
             override_reason=override_reason,
             metadata={
                 "source": "streamlit_ui",
@@ -321,5 +560,17 @@ def render_recommendation_review_controls(
         "effective_decision": effective_preview,
     }
     st.session_state.review_state_run_id = run_id
+    st.session_state[
+        "review_widgets_initialized_for_run"
+    ] = f"{session_id}:{run_id}"
 
-    st.success("Review decision saved. No PR has been created yet.")
+    # Keep the current widget values visible after saving. A later session
+    # reload rehydrates from the authoritative recommendation activity.
+    st.session_state[
+        "review_widgets_initialized_for_run"
+    ] = f"{session_id}:{run_id}"
+
+    st.success(
+        "Review decision saved. "
+        "No PR has been created yet."
+    )

@@ -1,30 +1,44 @@
 """
-Reasoning Node
+Contracted supplier reasoning with structured LLM output.
 
-This module handles intelligent analysis of supplier options using LLM
-with structured output. It supports per-item reasoning + product-level
-critical path calculation (Phase 1).
+The node recommends one supplier per item and builds a product-level summary
+covering critical path, feasibility, chosen suppliers, and total cost.
 """
 
-import os
-from typing import Dict, Any, List
-from datetime import datetime, date, timedelta
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
+from __future__ import annotations
+
+import time
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List
+
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
-load_dotenv()
+from core.exceptions import SupplierReasoningError
+from core.logging import get_logger
+from core.observability import traceable_if_enabled
 
 
-# ============================================================
-# PYDANTIC MODELS (Structured Output)
-# ============================================================
+REASONING_NODE_VERSION = (
+    "reasoning_node_v2 | production-clean-and-comparison-guardrails"
+)
+REASONING_MODEL = "gpt-4o"
+
+logger = get_logger("contracted_reasoning")
+
 
 class RecommendedSupplier(BaseModel):
     supplier_id: str
     supplier_name: str
-    reasoning: str = Field(..., description="Detailed explanation covering cost, risk, lead time feasibility, overage impact, and alignment with required date")
+    reasoning: str = Field(
+        ...,
+        description=(
+            "Detailed explanation covering cost, risk, lead-time "
+            "feasibility, overage impact, and alignment with the "
+            "required date."
+        ),
+    )
     total_cost: float
     effective_unit_price: float
     risk_level: str
@@ -66,88 +80,114 @@ class FullReasoningResult(BaseModel):
     product_level: ProductLevelSummary
 
 
-# ============================================================
-# HELPER: Calculate Available Days
-# ============================================================
+def get_available_days(required_date_str: str | None) -> int:
+    if not required_date_str:
+        return 30
 
-def get_available_days(required_date_str: str) -> int:
     try:
-        required = datetime.strptime(required_date_str, "%Y-%m-%d").date()
-        today = date.today()
-        return max(0, (required - today).days)
-    except:
-        return 30  # fallback
+        required = datetime.strptime(
+            required_date_str,
+            "%Y-%m-%d",
+        ).date()
+    except (TypeError, ValueError):
+        logger.warning(
+            "reasoning_required_date_defaulted",
+            component="contracted_reasoning",
+            status="completed_with_warning",
+            payload={
+                "required_date": required_date_str,
+                "default_available_days": 30,
+            },
+        )
+        return 30
+
+    return max(0, (required - date.today()).days)
 
 
-def calculate_suggested_date(critical_path_days: int, buffer_days: int = 1) -> str:
-    suggested = date.today() + timedelta(days=critical_path_days + buffer_days)
+def calculate_suggested_date(
+    critical_path_days: int,
+    buffer_days: int = 1,
+) -> str:
+    suggested = date.today() + timedelta(
+        days=critical_path_days + buffer_days
+    )
     return suggested.strftime("%Y-%m-%d")
 
 
-# ============================================================
-# REASONING NODE
-# ============================================================
+def _supplier_context(
+    supplier: Dict[str, Any],
+    available_days: int,
+) -> str:
+    lead_time = supplier.get("current_lead_time")
 
-def reason_and_recommend(supplier_intelligence_output: Dict[str, Any]) -> FullReasoningResult:
-    """
-    Reasoning Node with improved timeline handling and Critical Path calculation.
-    Returns both per-item recommendations and a product-level summary.
-    """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
-    structured_llm = llm.with_structured_output(ReasoningOutput)
+    try:
+        lead_time_value = int(float(lead_time))
+        timeline_feasible = lead_time_value <= available_days
+    except (TypeError, ValueError):
+        timeline_feasible = False
 
-    item_results = []
-    available_days = get_available_days(
-        supplier_intelligence_output.get("required_date", "2026-07-15")
-    )
-
-    for item in supplier_intelligence_output.get("items_analyzed", []):
-        item_id = item["item_id"]
-        item_name = item.get("item_name", "")
-        gross_requirement = item["gross_requirement"]
-        suppliers = item.get("suppliers", [])
-
-        if not suppliers:
-            continue
-
-        suppliers_context = []
-        for sup in suppliers:
-            context = f"""
-Supplier: {sup.get('supplier_name')} ({sup.get('supplier_id')})
-- Risk Level: {sup.get('risk_level')}
-- Lead Time: {sup.get('current_lead_time')} days
-- On-time Delivery: {sup.get('on_time_delivery_pct')}% | Quality Rejection: {sup.get('quality_rejection_pct')}%
-- Capacity: {sup.get('capacity_status')}
-- Contracted Price: {sup.get('contracted_price')} | Spot Price: {sup.get('spot_price')}
-- MOQ: {sup.get('moq')}
-- Recommended Order Qty (Batch): {sup.get('recommended_order_quantity')}
-- Total Cost (Contracted after discount): {sup.get('total_cost_contracted')}
-- Total Cost (Spot): {sup.get('total_cost_spot')}
-- Overage Quantity: {sup.get('overage_quantity')}
-- Bulk Discount Applied: {sup.get('bulk_discount_applied')}
+    return f"""
+Supplier: {supplier.get('supplier_name')} ({supplier.get('supplier_id')})
+- Risk Level: {supplier.get('risk_level')}
+- Lead Time: {lead_time} days
+- Timeline Feasible: {timeline_feasible}
+- Available Days: {available_days}
+- On-time Delivery: {supplier.get('on_time_delivery_pct')}%
+- Quality Rejection: {supplier.get('quality_rejection_pct')}%
+- Capacity: {supplier.get('capacity_status')}
+- Contracted Price: {supplier.get('contracted_price')}
+- Spot Price: {supplier.get('spot_price')}
+- MOQ: {supplier.get('moq')}
+- Recommended Order Qty (Batch): {supplier.get('recommended_order_quantity')}
+- Total Cost (Contracted after discount): {supplier.get('total_cost_contracted')}
+- Total Cost (Spot): {supplier.get('total_cost_spot')}
+- Effective Unit Price (Contracted): {supplier.get('effective_unit_price_contracted')}
+- Overage Quantity: {supplier.get('overage_quantity')}
+- Bulk Discount Applied: {supplier.get('bulk_discount_applied')}
 """
-            suppliers_context.append(context)
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are a highly disciplined procurement decision engine.
 
-Your task is to recommend **exactly one** best supplier for the item using a strict priority order.
+def _build_reasoning_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """You are a highly disciplined procurement decision engine.
 
-**Decision Priority (must follow in this exact order):**
-1. **Timeline Feasibility** — Can the supplier realistically deliver by the required date? (Lead time ≤ available days is strongly preferred. If no supplier meets it, choose the one with the shortest lead time + best reliability.)
-2. **Risk & Reliability** — Prioritize Low risk, high on-time delivery %, low quality rejection %.
-3. **Total Cost** — After applying bulk discount (if any) and considering overage cost.
-4. **Inventory Impact** — Lower overage is better.
+Recommend exactly one best contracted supplier for the item using this strict
+priority order:
 
-**Strict Rules:**
-- You must follow the priority order above. Do not randomly pick when options are close.
-- Be consistent. For the same input data, you should give the same recommendation every time.
-- If no supplier can meet the required date, clearly state this in the reasoning but still pick the best feasible option based on the priorities.
-- Never invent data. Only use the information provided.
+1. Timeline feasibility: lead time must be compared with available days.
+2. Risk and reliability: prefer lower risk, stronger on-time delivery, and
+   lower quality rejection.
+3. Total contracted cost after discount.
+4. Inventory impact from MOQ overage.
 
-Think step by step internally before outputting the final structured answer."""),
-            ("human", """
-Item: {item_name} ({item_id})
+Strict accuracy rules:
+- Use only the supplied data.
+- Verify every cheaper/more-expensive statement against the supplied
+  contracted total-cost values before writing it.
+- Never say an alternative is more expensive when its total cost is lower,
+  and never say it is cheaper when its total cost is higher.
+- A supplier is timeline-feasible when Lead Time <= Available Days.
+- Never call a supplier infeasible when Lead Time <= Available Days.
+- Use the phrase "only feasible supplier" only when exactly one supplier has
+  Timeline Feasible: True.
+- When multiple suppliers are feasible, explain why the selected supplier is
+  preferred; do not imply the alternatives cannot meet the date.
+- If no supplier is feasible, state that clearly and select the shortest-lead
+  option with the strongest reliability profile.
+- Preserve the decision-priority order. Do not select randomly when options
+  are close.
+- Return all non-selected suppliers in alternatives_considered.
+- Ensure recommended_supplier.can_deliver_on_time matches the supplied
+  timeline-feasibility fact.
+- Do not invent metrics or reverse numerical comparisons.
+
+Reason internally, then return only the required structured output.""",
+        ),
+        (
+            "human",
+            """Item: {item_name} ({item_id})
 Gross Requirement: {gross_requirement}
 Required Date: {required_date}
 Available Days until Required Date: {available_days}
@@ -155,73 +195,242 @@ Available Days until Required Date: {available_days}
 Suppliers Data:
 {suppliers_data}
 
-Provide your analysis in the required structured JSON format.
-""")
-        ])
+Return the required structured analysis.""",
+        ),
+    ])
 
-        chain = prompt | structured_llm
 
-        try:
-            response = chain.invoke({
-                "item_name": item_name,
-                "item_id": item_id,
-                "gross_requirement": gross_requirement,
-                "required_date": supplier_intelligence_output.get("required_date", "2026-07-15"),
-                "available_days": available_days,
-                "suppliers_data": "\n".join(suppliers_context)
-            })
-            item_results.append(response)
-        except Exception as e:
-            print(f"Error processing item {item_id}: {e}")
+@traceable_if_enabled(
+    name="Contracted Supplier Item Reasoning",
+    run_type="chain",
+    tags=["procurement", "contracted-reasoning", "item"],
+)
+def _reason_for_item(
+    *,
+    item_id: str,
+    item_name: str,
+    gross_requirement: float,
+    required_date: str,
+    available_days: int,
+    suppliers: List[Dict[str, Any]],
+) -> ReasoningOutput:
+    llm = ChatOpenAI(
+        model=REASONING_MODEL,
+        temperature=0.0,
+    )
+    structured_llm = llm.with_structured_output(
+        ReasoningOutput
+    )
+    chain = _build_reasoning_prompt() | structured_llm
 
-    # ============================================================
-    # Product Level Summary (Critical Path + Chosen Suppliers + Total Cost)
-    # ============================================================
-    if item_results:
-        critical_path = max(r.recommended_supplier.lead_time_days for r in item_results)
-        suggested_date = calculate_suggested_date(critical_path, buffer_days=1)
-        is_feasible = critical_path <= available_days
-
-        if is_feasible:
-            message = f"All items can be procured within the required date of {supplier_intelligence_output.get('required_date')}."
-        else:
-            message = f"The original required date is not feasible. A realistic fulfillment date would be around {suggested_date}."
-
-        # Build chosen suppliers summary + total cost
-        chosen_summary = []
-        total_cost = 0.0
-
-        for r in item_results:
-            rec = r.recommended_supplier
-            chosen_summary.append({
-                "item_id": r.item_id,
-                "item_name": r.item_name,
-                "supplier_name": rec.supplier_name,
-                "order_quantity": rec.overage_quantity + r.gross_requirement,  # Approximate
-                "lead_time_days": rec.lead_time_days,
-                "cost": rec.total_cost
-            })
-            total_cost += rec.total_cost
-
-        product_summary = ProductLevelSummary(
-            critical_path_days=critical_path,
-            suggested_realistic_date=suggested_date,
-            is_original_date_feasible=is_feasible,
-            overall_message=message,
-            chosen_suppliers_summary=chosen_summary,
-            total_procurement_cost=round(total_cost, 2)
+    suppliers_data = "\n".join(
+        _supplier_context(
+            supplier,
+            available_days,
         )
-    else:
-        product_summary = ProductLevelSummary(
+        for supplier in suppliers
+    )
+
+    return chain.invoke({
+        "item_name": item_name,
+        "item_id": item_id,
+        "gross_requirement": gross_requirement,
+        "required_date": required_date,
+        "available_days": available_days,
+        "suppliers_data": suppliers_data,
+    })
+
+
+def _build_product_summary(
+    *,
+    item_results: List[ReasoningOutput],
+    required_date: str,
+    available_days: int,
+) -> ProductLevelSummary:
+    if not item_results:
+        return ProductLevelSummary(
             critical_path_days=0,
             suggested_realistic_date="N/A",
             is_original_date_feasible=False,
             overall_message="No items to analyze.",
             chosen_suppliers_summary=[],
-            total_procurement_cost=0.0
+            total_procurement_cost=0.0,
         )
+
+    critical_path = max(
+        result.recommended_supplier.lead_time_days
+        for result in item_results
+    )
+    suggested_date = calculate_suggested_date(
+        critical_path,
+        buffer_days=1,
+    )
+    is_feasible = critical_path <= available_days
+
+    if is_feasible:
+        message = (
+            "All items can be procured within the required "
+            f"date of {required_date}."
+        )
+    else:
+        message = (
+            "The original required date is not feasible. "
+            "A realistic fulfillment date would be around "
+            f"{suggested_date}."
+        )
+
+    chosen_summary = []
+    total_cost = 0.0
+
+    for result in item_results:
+        recommendation = result.recommended_supplier
+
+        chosen_summary.append({
+            "item_id": result.item_id,
+            "item_name": result.item_name,
+            "supplier_name": recommendation.supplier_name,
+            "order_quantity": (
+                recommendation.overage_quantity
+                + result.gross_requirement
+            ),
+            "lead_time_days": recommendation.lead_time_days,
+            "cost": recommendation.total_cost,
+        })
+        total_cost += recommendation.total_cost
+
+    return ProductLevelSummary(
+        critical_path_days=critical_path,
+        suggested_realistic_date=suggested_date,
+        is_original_date_feasible=is_feasible,
+        overall_message=message,
+        chosen_suppliers_summary=chosen_summary,
+        total_procurement_cost=round(total_cost, 2),
+    )
+
+
+def reason_and_recommend(
+    supplier_intelligence_output: Dict[str, Any],
+) -> FullReasoningResult:
+    """
+    Recommend contracted suppliers and calculate the product critical path.
+
+    The public signature and structured output schema are preserved for the
+    supervisor, aggregator, persistence, conversation, and UI layers.
+    """
+    if not isinstance(supplier_intelligence_output, dict):
+        raise SupplierReasoningError(
+            "Supplier intelligence output must be a dictionary.",
+            component="contracted_reasoning",
+        )
+
+    required_date = (
+        supplier_intelligence_output.get("required_date")
+        or "N/A"
+    )
+    available_days = get_available_days(
+        supplier_intelligence_output.get("required_date")
+    )
+    items = (
+        supplier_intelligence_output.get(
+            "items_analyzed",
+            [],
+        )
+        or []
+    )
+
+    item_results: List[ReasoningOutput] = []
+
+    for item in items:
+        item_id = item.get("item_id")
+        item_name = item.get("item_name", "")
+        gross_requirement = item.get(
+            "gross_requirement",
+            0,
+        )
+        suppliers = item.get("suppliers", []) or []
+
+        if not suppliers:
+            logger.warning(
+                "contracted_reasoning_item_skipped",
+                component="contracted_reasoning",
+                status="completed_with_warning",
+                payload={
+                    "item_id": item_id,
+                    "reason": "no_supplier_options",
+                },
+            )
+            continue
+
+        started_at = time.perf_counter()
+
+        logger.info(
+            "contracted_item_reasoning_started",
+            component="contracted_reasoning",
+            status="running",
+            payload={
+                "item_id": item_id,
+                "supplier_count": len(suppliers),
+                "model": REASONING_MODEL,
+            },
+        )
+
+        try:
+            response = _reason_for_item(
+                item_id=item_id,
+                item_name=item_name,
+                gross_requirement=gross_requirement,
+                required_date=required_date,
+                available_days=available_days,
+                suppliers=suppliers,
+            )
+        except Exception as exc:
+            logger.exception(
+                "contracted_item_reasoning_failed",
+                error=exc,
+                component="contracted_reasoning",
+                status="failed",
+                duration_ms=(
+                    time.perf_counter() - started_at
+                )
+                * 1000,
+                payload={
+                    "item_id": item_id,
+                    "supplier_count": len(suppliers),
+                    "model": REASONING_MODEL,
+                },
+            )
+            raise SupplierReasoningError(
+                f"Contracted supplier reasoning failed for item {item_id}.",
+                component="contracted_reasoning",
+            ) from exc
+
+        item_results.append(response)
+
+        logger.info(
+            "contracted_item_reasoning_completed",
+            component="contracted_reasoning",
+            status="success",
+            duration_ms=(
+                time.perf_counter() - started_at
+            )
+            * 1000,
+            payload={
+                "item_id": item_id,
+                "selected_supplier": (
+                    response.recommended_supplier.supplier_name
+                ),
+                "supplier_count": len(suppliers),
+                "model": REASONING_MODEL,
+            },
+        )
+
+    product_summary = _build_product_summary(
+        item_results=item_results,
+        required_date=required_date,
+        available_days=available_days,
+    )
 
     return FullReasoningResult(
         items=item_results,
-        product_level=product_summary
+        product_level=product_summary,
     )
