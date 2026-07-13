@@ -344,7 +344,7 @@ LOG_LEVEL=INFO
 # Database Initialization
 
 ```bash
-python -m scripts.database_setup
+python -m src.setup_database
 python -m pr_po.schema_migration
 ```
 
