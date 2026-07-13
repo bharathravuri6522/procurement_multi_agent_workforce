@@ -44,7 +44,10 @@ from ui.purchase_requisitions import render_purchase_requisitions_page
 from ui.purchase_orders import render_purchase_orders_page
 from ui.chat import render_chat_panel
 from ui.activity import render_activity_log
-
+from core.observability import log_observability_status
+from architecture_explorer.app import (
+    render_architecture_explorer,
+)
 
 st.set_page_config(
     page_title="ForgeForce Procurement AI",
@@ -54,6 +57,7 @@ st.set_page_config(
 
 init_session_state()
 init_db()
+log_observability_status()
 
 render_sidebar_session_selector()
 
@@ -66,12 +70,15 @@ if not st.session_state.app_user:
     st.stop()
 
 
+st.sidebar.markdown("### Application")
+
 app_page = st.sidebar.radio(
-    "Workflow",
+    "Navigation",
     [
         "Procurement Analysis",
         "Purchase Requisitions",
         "Purchase Orders",
+        "Architecture Explorer",
     ],
     key="main_workflow_navigation",
 )
@@ -86,7 +93,9 @@ if app_page == "Purchase Orders":
     render_purchase_orders_page()
     st.stop()
 
-
+if app_page == "Architecture Explorer":
+    render_architecture_explorer()
+    st.stop()
 # ---------------------------------------------------------------------------
 # Procurement Analysis Page
 # ---------------------------------------------------------------------------
