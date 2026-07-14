@@ -360,11 +360,6 @@ streamlit run src/streamlit_app.py
 
 ---
 
-# Screenshots
-
-Include screenshots of the Dashboard, Procurement Analysis, Human Review, Conversation Assistant, Purchase Requisition, Purchase Orders and LangSmith traces.
-
----
 
 # License
 
